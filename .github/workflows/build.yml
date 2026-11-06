@@ -1,0 +1,34 @@
+name: Build RLSideswipeBot .dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:   # lets you trigger manually from GitHub UI
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          brew install ldid xz
+          export THEOS=~/theos
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
+
+      - name: Build dylib
+        run: |
+          make clean
+          make FINALPACKAGE=0
+
+      - name: Upload .dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RLSideswipeBot_v1-dylib
+          path: .theos/obj/debug/RLSideswipeBot_v1.dylib
+          retention-days: 30
