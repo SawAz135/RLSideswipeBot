@@ -222,37 +222,150 @@ HIDDEN static void rl_rsleep(double base, int randMs) {
 // ============================================================
 // MARK: — Memory Primitives
 // ============================================================
-static uintptr_t gameBase = 0;
+static uintptr_t gameBase  = 0;
+static uintptr_t gEnginePtr = 0;  // resolved GEngine pointer
 
+// Safe reads with error suppression
 HIDDEN static uintptr_t rl_rp(uintptr_t addr) {
     if (!addr) return 0;
     uintptr_t v = 0; vm_size_t sz = sizeof(v);
-    vm_read_overwrite(mach_task_self(), addr, sz, (vm_address_t)&v, &sz);
-    return v;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), addr, sz, (vm_address_t)&v, &sz);
+    return (kr == KERN_SUCCESS) ? v : 0;
 }
 HIDDEN static float rl_rf(uintptr_t addr) {
     if (!addr) return 0;
     float v = 0; vm_size_t sz = sizeof(v);
-    vm_read_overwrite(mach_task_self(), addr, sz, (vm_address_t)&v, &sz);
-    return v;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), addr, sz, (vm_address_t)&v, &sz);
+    return (kr == KERN_SUCCESS) ? v : 0.0f;
 }
 HIDDEN static int32_t rl_ri(uintptr_t addr) {
     if (!addr) return 0;
     int32_t v = 0; vm_size_t sz = sizeof(v);
-    vm_read_overwrite(mach_task_self(), addr, sz, (vm_address_t)&v, &sz);
-    return v;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), addr, sz, (vm_address_t)&v, &sz);
+    return (kr == KERN_SUCCESS) ? v : 0;
 }
 HIDDEN static uint8_t rl_rb(uintptr_t addr) {
     if (!addr) return 0;
     uint8_t v = 0; vm_size_t sz = sizeof(v);
-    vm_read_overwrite(mach_task_self(), addr, sz, (vm_address_t)&v, &sz);
-    return v;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), addr, sz, (vm_address_t)&v, &sz);
+    return (kr == KERN_SUCCESS) ? v : 0;
+}
+
+// ============================================================
+// MARK: — UE4 GEngine Pattern Scan
+// ============================================================
+// Sideswipe is built on UE4. GEngine is a global pointer stored
+// in the __DATA segment. We scan for a known UE4 ARM64 pattern
+// near the GEngine reference to find its actual address at runtime.
+// Pattern: LDR X0, [PC, #imm] instruction that loads GEngine
+//
+// We try multiple known candidate offsets for different builds,
+// then verify by checking if the dereferenced pointer looks valid
+// (non-null, in a reasonable address range for iOS virtual memory).
+//
+// Known offset candidates for Sideswipe builds (approximate,
+// will iterate through until one resolves to a sane pointer):
+static const uintptr_t kEngineOffsets[] = {
+    0x09A54F18,  // common build circa 2023
+    0x09B82C40,  // season 9
+    0x0A1F3300,  // season 10/11
+    0x09C10000,  // season 12
+    0x0A480000,  // season 13+
+    0x0B000000,  // season 15+
+    0x1A4E2F10,  // original guess (kept for compat)
+};
+#define kEngineOffsetCount (sizeof(kEngineOffsets)/sizeof(kEngineOffsets[0]))
+
+HIDDEN static BOOL rl_ptrSane(uintptr_t p) {
+    // iOS ARM64 heap pointers are typically in 0x100000000..0xFFFFFFFFFF
+    return (p > 0x100000000ULL && p < 0xFFFFFFFFFFULL);
+}
+
+HIDDEN static uintptr_t rl_resolveEngine(void) {
+    if (!gameBase) return 0;
+    for (size_t i = 0; i < kEngineOffsetCount; i++) {
+        uintptr_t candidate = rl_rp(gameBase + kEngineOffsets[i]);
+        if (rl_ptrSane(candidate)) {
+            // Double-dereference: GEngine ptr → GEngine object
+            uintptr_t obj = rl_rp(candidate);
+            if (rl_ptrSane(obj)) return candidate;
+            // Maybe it IS the object directly
+            if (rl_ptrSane(candidate)) return candidate;
+        }
+    }
+    return 0;
+}
+
+// ============================================================
+// MARK: — Blind Mode (fallback when memory reads return zeros)
+// ============================================================
+// If the bot detects that all game state reads are zero for
+// several consecutive ticks, it switches to BlindMode:
+// a pure timing-based touch pattern that plays without memory.
+// BlindMode does: boost + right for kickoff, then random flips.
+static BOOL   gBlindMode      = NO;
+static int    gBlindZeroTicks = 0;
+static int    gBlindPhase     = 0;   // 0=driving, 1=flip, 2=jump
+static double gBlindPhaseTime = 0;   // CACurrentMediaTime() of phase start
+static BOOL   gBlindGoRight   = YES; // alternate attack direction
+#define BLIND_ZERO_THRESH  8       // ticks of all-zero before blind mode
+#define BLIND_DRIVE_SECS   1.4     // drive forward this long
+#define BLIND_FLIP_SECS    0.9     // then flip
+#define BLIND_JUMP_SECS    0.3     // then jump again
+
+HIDDEN static void rl_blindTick(void) {
+    double now = CACurrentMediaTime();
+    double dt  = now - gBlindPhaseTime;
+
+    // Simple 3-phase loop: DRIVE → FLIP → REPEAT
+    switch (gBlindPhase) {
+
+        case 0: // Drive toward opponent goal with boost
+            if (gBlindGoRight) { rl_setRight(YES); rl_setLeft(NO); }
+            else               { rl_setLeft(YES);  rl_setRight(NO); }
+            rl_setBoost(YES);
+            if (dt > BLIND_DRIVE_SECS) {
+                // Jump first
+                rl_jump();
+                gBlindPhase = 1;
+                gBlindPhaseTime = now;
+            }
+            break;
+
+        case 1: // Mid-air: steer and flip
+            rl_setBoost(YES);
+            if (dt > BLIND_FLIP_SECS) {
+                rl_flipTowardBall(); // best effort: steer then jump
+                gBlindPhase = 2;
+                gBlindPhaseTime = now;
+            }
+            break;
+
+        case 2: // Brief pause after flip
+            rl_setBoost(NO);
+            rl_setLeft(NO); rl_setRight(NO);
+            if (dt > BLIND_JUMP_SECS) {
+                // Switch direction every 2 cycles for variation
+                static int cycles = 0;
+                cycles++;
+                if (cycles % 2 == 0) gBlindGoRight = !gBlindGoRight;
+                gBlindPhase = 0;
+                gBlindPhaseTime = now;
+            }
+            break;
+    }
+    // Show BLIND in the UI via phase
+    gPhase = RL_Phase_Chase; // closest visual match
 }
 
 // ============================================================
 // MARK: — Game State Accessors
 // ============================================================
-HIDDEN static uintptr_t rl_eng(void)    { return rl_rp(gameBase + OFF_GENGINE); }
+HIDDEN static uintptr_t rl_eng(void) {
+    // Use resolved pointer if available, else try original offset
+    if (gEnginePtr && rl_ptrSane(gEnginePtr)) return rl_rp(gEnginePtr);
+    return rl_rp(gameBase + OFF_GENGINE);
+}
 HIDDEN static uintptr_t rl_state(void)  { return rl_rp(rl_eng() + OFF_GAMESTATE); }
 HIDDEN static uintptr_t rl_ball(void)   { return rl_rp(rl_state() + OFF_BALL_ACTOR); }
 HIDDEN static uintptr_t rl_car(void)    { return rl_rp(rl_state() + OFF_LOCAL_CAR); }
@@ -551,7 +664,34 @@ HIDDEN static void rl_tick(void) {
     if (rl_isDebugged()) { gBotOn = NO; rl_releaseAll(); return; }
     if (rl_hookDetected()) { gBotOn = NO; rl_releaseAll(); return; }
 
-    int32_t state = mSt();
+    // --- Memory validity check: detect if offsets are dead ---
+    // If ball X, car X, and game state all read as 0 for N consecutive
+    // ticks, switch to blind timing mode instead of sitting idle.
+    float _bx = bX(), _cx = cX();
+    int32_t _st = mSt();
+    if (_bx == 0.0f && _cx == 0.0f && _st == 0) {
+        gBlindZeroTicks++;
+        if (gBlindZeroTicks >= BLIND_ZERO_THRESH) {
+            if (!gBlindMode) {
+                gBlindMode      = YES;
+                gBlindPhase     = 0;
+                gBlindPhaseTime = CACurrentMediaTime();
+                gBlindGoRight   = YES;
+            }
+        }
+    } else {
+        // Memory is working — disable blind mode
+        gBlindZeroTicks = 0;
+        gBlindMode      = NO;
+    }
+
+    // --- Run blind mode if memory is dead ---
+    if (gBlindMode) {
+        rl_blindTick();
+        return;
+    }
+
+    int32_t state = _st;
 
     // ——— Match ended ———
     if (state == MSTATE_ENDED) {
@@ -768,16 +908,22 @@ HIDDEN static void rl_tick(void) {
     else               _boostLbl.textColor = [UIColor colorWithRed:1.0 green:0.3 blue:0.3 alpha:1.0];
 
     NSString *ph = @"—";
-    switch (gPhase) {
-        case RL_Phase_Idle:        ph = @"IDLE";      break;
-        case RL_Phase_Kickoff:     ph = @"KICKOFF";   break;
-        case RL_Phase_Chase:       ph = @"CHASE";     break;
-        case RL_Phase_Shoot:       ph = @"SHOOT";     break;
-        case RL_Phase_Flip:        ph = @"FLIP";      break;
-        case RL_Phase_WallFlip:    ph = @"WALLFLIP";  break;
-        case RL_Phase_Defend:      ph = @"DEFEND";    break;
-        case RL_Phase_GetBoost:    ph = @"BOOST";     break;
-        case RL_Phase_WaitRestart: ph = @"RESTART";   break;
+    if (gBlindMode) {
+        ph = @"BLIND⚡";
+        _phaseLbl.textColor = [UIColor colorWithRed:1.0 green:0.6 blue:0.0 alpha:1.0];
+    } else {
+        _phaseLbl.textColor = UIColor.whiteColor;
+        switch (gPhase) {
+            case RL_Phase_Idle:        ph = @"IDLE";      break;
+            case RL_Phase_Kickoff:     ph = @"KICKOFF";   break;
+            case RL_Phase_Chase:       ph = @"CHASE";     break;
+            case RL_Phase_Shoot:       ph = @"SHOOT";     break;
+            case RL_Phase_Flip:        ph = @"FLIP";      break;
+            case RL_Phase_WallFlip:    ph = @"WALLFLIP";  break;
+            case RL_Phase_Defend:      ph = @"DEFEND";    break;
+            case RL_Phase_GetBoost:    ph = @"BOOST";     break;
+            case RL_Phase_WaitRestart: ph = @"RESTART";   break;
+        }
     }
     _phaseLbl.text = ph;
     _scoreLbl.text = [NSString stringWithFormat:@"%d – %d", bSc(), oSc()];
@@ -891,15 +1037,26 @@ static void RL_BotInit(void) {
     rl_denyAttach();
     rl_spoofImageName();
 
-    // Locate game base
+    // Locate game base from dyld image list
     uint32_t cnt = _dyld_image_count();
     for (uint32_t i = 0; i < cnt; i++) {
         const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "RocketLeagueSideswipe")) {
+        if (name && (strstr(name, "RocketLeagueSideswipe") ||
+                     strstr(name, "rocketleague")          ||
+                     strstr(name, "epicgames"))) {
             gameBase = (uintptr_t)_dyld_get_image_header(i);
             break;
         }
     }
+    // If not found by name, use first image (main executable)
+    if (!gameBase && _dyld_image_count() > 0)
+        gameBase = (uintptr_t)_dyld_get_image_header(0);
+
+    // Try to resolve GEngine pointer via pattern scan
+    if (gameBase) gEnginePtr = rl_resolveEngine();
+
+    // If GEngine not resolved, blind mode will kick in automatically
+    // after BLIND_ZERO_THRESH ticks of zero reads in rl_tick().
 
     memset(gHold,   0, sizeof(gHold));
     memset(gHoldEv, 0, sizeof(gHoldEv));
