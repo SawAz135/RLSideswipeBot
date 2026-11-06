@@ -1,4 +1,4 @@
-name: Build RLSideswipeBot .dylib
+name: Build RLSideswipeBot .dylib + IPA
 
 on:
   push:
@@ -26,7 +26,6 @@ jobs:
         env:
           THEOS: ${{ github.workspace }}/theos
         run: |
-          # Download prebuilt SDK directly (no GitHub API token needed)
           curl -LO https://github.com/theos/sdks/archive/master.tar.gz
           tar -xzf master.tar.gz
           mkdir -p $THEOS/sdks
@@ -39,9 +38,85 @@ jobs:
           make clean
           make FINALPACKAGE=0
 
-      - name: Upload .dylib artifact
+      - name: Build insert_dylib
+        run: |
+          git clone https://github.com/tyilo/insert_dylib.git
+          cd insert_dylib
+          xcodebuild -scheme insert_dylib \
+            -configuration Release \
+            CONFIGURATION_BUILD_DIR=../insert_dylib_build \
+            > /dev/null 2>&1
+          cd ..
+          echo "${{ github.workspace }}/insert_dylib_build" >> $GITHUB_PATH
+
+      - name: Download decrypted IPA
+        run: |
+          # Try multiple sources for the decrypted IPA
+          echo "Trying decrypt.day..."
+          curl -L "https://decrypt.day/app/id1549027048/download" \
+            -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" \
+            -H "Accept: application/octet-stream,*/*" \
+            --retry 3 --retry-delay 5 \
+            -o RLSideswipe_decrypted.ipa 2>/dev/null || true
+
+          # Verify it's a valid zip/IPA
+          if unzip -t RLSideswipe_decrypted.ipa > /dev/null 2>&1; then
+            echo "IPA_AVAILABLE=true" >> $GITHUB_ENV
+            echo "✅ IPA downloaded successfully"
+          else
+            echo "IPA_AVAILABLE=false" >> $GITHUB_ENV
+            echo "⚠️ IPA download failed — dylib only will be uploaded"
+          fi
+
+      - name: Inject dylib into IPA
+        if: env.IPA_AVAILABLE == 'true'
+        run: |
+          DYLIB=".theos/obj/debug/RLSideswipeBot_v1.dylib"
+          DYLIB_NAME="RLSideswipeBot_v1.dylib"
+
+          # Unzip IPA
+          mkdir -p Payload_work
+          unzip -q RLSideswipe_decrypted.ipa -d Payload_work
+
+          # Find the .app bundle
+          APP=$(find Payload_work/Payload -maxdepth 1 -name "*.app" | head -1)
+          echo "App: $APP"
+
+          # Find main binary via Info.plist
+          EXEC_NAME=$(/usr/libexec/PlistBuddy -c "Print CFBundleExecutable" "$APP/Info.plist")
+          BINARY="$APP/$EXEC_NAME"
+          echo "Binary: $BINARY"
+
+          # Copy dylib into app bundle
+          cp "$DYLIB" "$APP/$DYLIB_NAME"
+
+          # Inject load command
+          insert_dylib --strip-codesig --inplace \
+            "@executable_path/$DYLIB_NAME" \
+            "$BINARY"
+
+          # Ad-hoc sign (AltStore/Sideloadly will re-sign with your cert)
+          codesign --force --sign - "$APP/$DYLIB_NAME"
+          codesign --force --deep --sign - "$APP"
+
+          # Repack into IPA
+          cd Payload_work
+          zip -qr ../RLSideswipe_Hacked.ipa Payload
+          cd ..
+
+          echo "✅ IPA ready: RLSideswipe_Hacked.ipa"
+
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
           name: RLSideswipeBot_v1-dylib
           path: .theos/obj/debug/RLSideswipeBot_v1.dylib
           retention-days: 30
+
+      - name: Upload hacked IPA
+        if: env.IPA_AVAILABLE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: RLSideswipe_Hacked-ipa
+          path: RLSideswipe_Hacked.ipa
+          retention-days: 7
