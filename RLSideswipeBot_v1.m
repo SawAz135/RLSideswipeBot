@@ -313,6 +313,27 @@ static BOOL   gBlindGoRight   = YES; // alternate attack direction
 #define BLIND_FLIP_SECS    0.9     // then flip
 #define BLIND_JUMP_SECS    0.3     // then jump again
 
+// Forward declarations required by rl_blindTick (defined later in file)
+HIDDEN static void rl_setBoost(BOOL on);
+HIDDEN static void rl_setLeft(BOOL on);
+HIDDEN static void rl_setRight(BOOL on);
+HIDDEN static void rl_jump(void);
+HIDDEN static void rl_flipTowardBall(void);
+
+// Phase enum forward — full definition appears later after the AI section
+typedef NS_ENUM(int, RL_BotPhase) {
+    RL_Phase_Idle,
+    RL_Phase_Kickoff,
+    RL_Phase_Chase,
+    RL_Phase_Shoot,
+    RL_Phase_Flip,
+    RL_Phase_WallFlip,
+    RL_Phase_Defend,
+    RL_Phase_GetBoost,
+    RL_Phase_WaitRestart
+};
+static RL_BotPhase gPhase = RL_Phase_Idle;
+
 HIDDEN static void rl_blindTick(void) {
     double now = CACurrentMediaTime();
     double dt  = now - gBlindPhaseTime;
@@ -584,19 +605,7 @@ HIDDEN static void rl_steerToward(float targetX) {
 //   - No Demo (Sideswipe cars don't explode on contact like RL PC)
 //   - Goals on X axis (left/right), not top/bottom
 //   - Powerslide = ground tight turn (same button as air-roll)
-typedef NS_ENUM(int, RL_BotPhase) {
-    RL_Phase_Idle,
-    RL_Phase_Kickoff,    // countdown → drive to center X=0 at max boost
-    RL_Phase_Chase,      // approach ball, steer to its X, boost if far
-    RL_Phase_Shoot,      // near ball, in opponent half → push toward their goal X
-    RL_Phase_Flip,       // ball above car → double-jump flip toward it
-    RL_Phase_WallFlip,   // near arena wall → wall-flip for speed/height
-    RL_Phase_Defend,     // ball heading to our goal X → get between ball and goal
-    RL_Phase_GetBoost,   // low boost → steer to nearest active pad
-    RL_Phase_WaitRestart
-};
-
-static RL_BotPhase gPhase      = RL_Phase_Idle;
+// RL_BotPhase and gPhase declared above (before rl_blindTick)
 static BOOL        gBotOn      = NO;
 static int         gLastBlue   = 0;
 static BOOL        gEndHandled = NO;
