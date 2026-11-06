@@ -43,6 +43,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -520,13 +521,13 @@ HIDDEN static RL_BotPhase rl_decide(void) {
     // Ball heading toward our goal X → defend
     // "our goal" is on the X axis. Ball going in that direction and near goal line.
     float ourGoalX = rl_ourGoalX();
-    float predBallGoalDist = fabsf(pred.x - ourGoalX);
+    float predBallGoalDist = (float)fabs(pred.x - ourGoalX);
     BOOL ballGoingOurWay = (ourGoalX < 0) ? (bVX() < -30.0f) : (bVX() > 30.0f);
-    if (ballGoingOurWay && predBallGoalDist < 180.0f && fabsf(bx - ourGoalX) < 300.0f)
+    if (ballGoingOurWay && predBallGoalDist < 180.0f && (float)fabs(bx - ourGoalX) < 300.0f)
         return RL_Phase_Defend;
 
     // Near arena side wall → wall-flip opportunity for speed
-    if (fabsf(cx) > WALL_FLIP_THRESH && cGnd() && distCB() > 150.0f)
+    if ((float)fabs(cx) > WALL_FLIP_THRESH && cGnd() && distCB() > 150.0f)
         return RL_Phase_WallFlip;
 
     // Ball is significantly above the car and we're close → flip up at it
@@ -666,7 +667,7 @@ HIDDEN static void rl_tick(void) {
             rl_steerToward(targetX);
             rl_setBoost(cBst() > BOOST_USE_THRESH);
             // Powerslide for tight turn if overshooting
-            float diff = fabsf(targetX - cX());
+            float diff = (float)fabs(targetX - cX());
             rl_setPowerslide(diff < 40.0f && cGnd());
             // Clear the ball with a jump-hit if close enough
             if (distCB() < 85.0f && cGnd()) {
