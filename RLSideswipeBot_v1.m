@@ -507,7 +507,7 @@ typedef struct {
 
 // Load GSEvent purple send function dynamically
 typedef void (*GSEventSendFunc)(int type, float x, float y, float radius);
-static GSEventSendFunc gGSSend = NULL;
+// GSEventSendFunc not used — IOHIDEvent path is primary
 
 // IOHIDEvent function pointers (loaded from IOKit)
 typedef IOHIDEventRef (*IOHIDEventCreateDigitizerFingerEventFunc)(
