@@ -513,9 +513,9 @@ static GSEventSendFunc gGSSend = NULL;
 typedef IOHIDEventRef (*IOHIDEventCreateDigitizerFingerEventFunc)(
     CFAllocatorRef alloc, uint64_t timestamp,
     uint32_t index, uint32_t identity, uint32_t eventMask,
-    IOOptionBits field1, float x, float y, float z,
+    uint32_t field1, float x, float y, float z,
     float tipPressure, float twist, Boolean range, Boolean touch,
-    IOOptionBits options);
+    uint32_t options);
 typedef void (*IOHIDEventSetSenderIDFunc)(IOHIDEventRef, uint64_t);
 typedef void (*IOHIDEventSystemClientDispatchEventFunc)(IOHIDEventSystemClientRef, IOHIDEventRef);
 typedef IOHIDEventSystemClientRef (*IOHIDEventSystemClientCreateFunc)(CFAllocatorRef);
