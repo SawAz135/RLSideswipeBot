@@ -509,17 +509,16 @@ HIDDEN static UIView *rl_ueView(void) {
     if (!root) root = win;
 
     // Walk subviews looking for the deepest full-screen view (UE renders to it)
-    // Fall back to root if none found
+    // Iterative BFS — no recursive block to avoid retain cycle
     __block UIView *best = root;
     CGFloat screenArea = win.bounds.size.width * win.bounds.size.height;
-    void (^scan)(UIView *) = nil;
-    __block void (^scan_)(UIView *) = nil;
-    scan_ = ^(UIView *v) {
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:root];
+    while (queue.count) {
+        UIView *v = queue[0]; [queue removeObjectAtIndex:0];
         CGFloat area = v.bounds.size.width * v.bounds.size.height;
         if (area >= screenArea * 0.9f) best = v;
-        for (UIView *sub in v.subviews) scan_(sub);
-    };
-    scan_(root);
+        [queue addObjectsFromArray:v.subviews];
+    }
     gUEView = best;
     return gUEView;
 }
