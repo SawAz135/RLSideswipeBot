@@ -476,21 +476,70 @@ HIDDEN static CGPoint rl_padPos(int idx) {
 }
 
 // ============================================================
-// MARK: — UITouch Private API
+// MARK: — IOHIDEvent Touch Injection (jailbreak-safe, iOS 15/16+)
 // ============================================================
-@interface UITouch (RL_Priv)
-- (id)_initWithTarget:(id)t;
-- (void)_setLocationInWindow:(CGPoint)l;
-- (void)_setPhase:(UITouchPhase)p;
-- (void)_setTimestamp:(double)ts;
-@end
-@interface UIApplication (RL_Priv)
-- (void)_touchesEvent:(UIEvent *)e;
-@end
-@interface UIEvent (RL_Priv)
-- (void)_clearTouches;
-- (void)_addTouch:(UITouch *)t forDelayedDelivery:(BOOL)d;
-@end
+// Uses IOHIDEvent via GSEvent purple channel — the only reliable
+// touch injection method on jailbroken iOS 15/16/17.
+// Falls back gracefully if the framework isn't available.
+// ============================================================
+
+// IOHIDEvent types
+#define kIOHIDEventTypeNULL              0
+#define kIOHIDEventTypeDigitizer         11
+#define kIOHIDDigitizerEventRange        0x00000001
+#define kIOHIDDigitizerEventTouch        0x00000002
+#define kIOHIDDigitizerEventPosition     0x00000004
+#define kIOHIDDigitizerTransducerTypeHand 0
+#define kIOHIDDigitizerTransducerTypeFinger 1
+
+typedef struct __IOHIDEvent *IOHIDEventRef;
+typedef void *IOHIDEventSystemClientRef;
+
+// GSEvent purple
+typedef struct {
+    unsigned int type;
+    float x, y;
+    float pressure;
+    int finger;
+    unsigned int flags;
+    double timestamp;
+} GSTouchEvent;
+
+// Load GSEvent purple send function dynamically
+typedef void (*GSEventSendFunc)(int type, float x, float y, float radius);
+static GSEventSendFunc gGSSend = NULL;
+
+// IOHIDEvent function pointers (loaded from IOKit)
+typedef IOHIDEventRef (*IOHIDEventCreateDigitizerFingerEventFunc)(
+    CFAllocatorRef alloc, uint64_t timestamp,
+    uint32_t index, uint32_t identity, uint32_t eventMask,
+    IOOptionBits field1, float x, float y, float z,
+    float tipPressure, float twist, Boolean range, Boolean touch,
+    IOOptionBits options);
+typedef void (*IOHIDEventSetSenderIDFunc)(IOHIDEventRef, uint64_t);
+typedef void (*IOHIDEventSystemClientDispatchEventFunc)(IOHIDEventSystemClientRef, IOHIDEventRef);
+typedef IOHIDEventSystemClientRef (*IOHIDEventSystemClientCreateFunc)(CFAllocatorRef);
+
+static IOHIDEventCreateDigitizerFingerEventFunc   _IOHIDEventCreateDigitizerFingerEvent = NULL;
+static IOHIDEventSetSenderIDFunc                  _IOHIDEventSetSenderID = NULL;
+static IOHIDEventSystemClientDispatchEventFunc    _IOHIDEventSystemClientDispatchEvent = NULL;
+static IOHIDEventSystemClientCreateFunc           _IOHIDEventSystemClientCreate = NULL;
+static IOHIDEventSystemClientRef                  gHIDClient = NULL;
+
+HIDDEN static void rl_initHID(void) {
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    if (!iokit) return;
+    _IOHIDEventCreateDigitizerFingerEvent = (IOHIDEventCreateDigitizerFingerEventFunc)
+        dlsym(iokit, "IOHIDEventCreateDigitizerFingerEvent");
+    _IOHIDEventSetSenderID = (IOHIDEventSetSenderIDFunc)
+        dlsym(iokit, "IOHIDEventSetSenderID");
+    _IOHIDEventSystemClientDispatchEvent = (IOHIDEventSystemClientDispatchEventFunc)
+        dlsym(iokit, "IOHIDEventSystemClientDispatchEvent");
+    _IOHIDEventSystemClientCreate = (IOHIDEventSystemClientCreateFunc)
+        dlsym(iokit, "IOHIDEventSystemClientCreate");
+    if (_IOHIDEventSystemClientCreate)
+        gHIDClient = _IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+}
 
 HIDDEN static UIWindow *rl_win(void) {
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes.allObjects)
@@ -499,57 +548,71 @@ HIDDEN static UIWindow *rl_win(void) {
     return [UIApplication sharedApplication].windows.firstObject;
 }
 
-HIDDEN static void rl_sendTouch(UITouch *t, UITouchPhase phase) {
-    [t _setPhase:phase];
-    [t _setTimestamp:CACurrentMediaTime()];
-    UIEvent *e = [[UIEvent alloc] init];
-    [e _clearTouches];
-    [e _addTouch:t forDelayedDelivery:NO];
-    [[UIApplication sharedApplication] _touchesEvent:e];
+// Convert normalised coords (0..1) to screen pixels
+HIDDEN static CGPoint rl_normToScreen(CGPoint norm) {
+    UIWindow *w = rl_win();
+    CGSize sz = w ? w.bounds.size : CGSizeMake(390, 844); // fallback: iPhone 14 size
+    return rl_jitter(CGPointMake(norm.x * sz.width, norm.y * sz.height));
 }
 
-HIDDEN static void rl_tap(CGPoint norm, double hold) {
-    UIWindow *w = rl_win(); if (!w) return;
-    CGSize sz = w.bounds.size;
-    CGPoint pt = rl_jitter(CGPointMake(norm.x * sz.width, norm.y * sz.height));
-    UITouch *t = [[UITouch alloc] _initWithTarget:w];
-    [t _setLocationInWindow:pt];
-    rl_sendTouch(t, UITouchPhaseBegan);
-    if (hold > 0) rl_rsleep(hold, 20);
-    rl_sendTouch(t, UITouchPhaseEnded);
+// Send a single HID touch event
+HIDDEN static void rl_hidTouch(CGPoint screenPt, uint32_t phase, int finger) {
+    if (!_IOHIDEventCreateDigitizerFingerEvent || !gHIDClient) return;
+    uint64_t ts = (uint64_t)(CACurrentMediaTime() * 1e9);
+    // Normalize to 0..1 for HID (it expects unit coords)
+    UIWindow *w = rl_win();
+    CGSize sz = w ? w.bounds.size : CGSizeMake(390, 844);
+    float nx = (float)(screenPt.x / sz.width);
+    float ny = (float)(screenPt.y / sz.height);
+    // phase: 1=began, 2=moved, 4=ended
+    Boolean touching = (phase != 4);
+    IOHIDEventRef ev = _IOHIDEventCreateDigitizerFingerEvent(
+        kCFAllocatorDefault, ts,
+        (uint32_t)finger, (uint32_t)(finger + 1),
+        kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventPosition,
+        0, nx, ny, 0,
+        touching ? 0.5f : 0.0f, 0,
+        touching, touching, 0);
+    if (ev) {
+        if (_IOHIDEventSetSenderID) _IOHIDEventSetSenderID(ev, 0x0);
+        _IOHIDEventSystemClientDispatchEvent(gHIDClient, ev);
+        CFRelease(ev);
+    }
 }
 
-// Persistent hold slots
-static UITouch *gHold[4];
-static UIEvent *gHoldEv[4];
+// ————— Hold state: track which finger (slot) is down at what screen position —————
 #define SLOT_BOOST    0
 #define SLOT_LEFT     1
 #define SLOT_RIGHT    2
 #define SLOT_AIRROLL  3
+#define SLOT_COUNT    4
+
+static BOOL    gSlotActive[SLOT_COUNT];
+static CGPoint gSlotPt[SLOT_COUNT];
 
 HIDDEN static void rl_holdBegin(int slot, CGPoint norm) {
-    if (gHold[slot]) return;
-    UIWindow *w = rl_win(); if (!w) return;
-    CGSize sz = w.bounds.size;
-    CGPoint pt = rl_jitter(CGPointMake(norm.x * sz.width, norm.y * sz.height));
-    UITouch *t = [[UITouch alloc] _initWithTarget:w];
-    [t _setLocationInWindow:pt];
-    [t _setPhase:UITouchPhaseBegan];
-    [t _setTimestamp:CACurrentMediaTime()];
-    UIEvent *e = [[UIEvent alloc] init];
-    [e _clearTouches]; [e _addTouch:t forDelayedDelivery:NO];
-    [[UIApplication sharedApplication] _touchesEvent:e];
-    gHold[slot] = t; gHoldEv[slot] = e;
+    if (gSlotActive[slot]) return;
+    CGPoint pt = rl_normToScreen(norm);
+    gSlotPt[slot]    = pt;
+    gSlotActive[slot] = YES;
+    rl_hidTouch(pt, 1 /*began*/, slot);
 }
 
 HIDDEN static void rl_holdEnd(int slot) {
-    if (!gHold[slot]) return;
-    rl_sendTouch(gHold[slot], UITouchPhaseEnded);
-    gHold[slot] = nil; gHoldEv[slot] = nil;
+    if (!gSlotActive[slot]) return;
+    rl_hidTouch(gSlotPt[slot], 4 /*ended*/, slot);
+    gSlotActive[slot] = NO;
 }
 
 HIDDEN static void rl_releaseAll(void) {
-    for (int i = 0; i < 4; i++) rl_holdEnd(i);
+    for (int i = 0; i < SLOT_COUNT; i++) rl_holdEnd(i);
+}
+
+HIDDEN static void rl_tap(CGPoint norm, double hold) {
+    CGPoint pt = rl_normToScreen(norm);
+    rl_hidTouch(pt, 1 /*began*/, SLOT_COUNT); // finger 4 = taps
+    if (hold > 0) rl_rsleep(hold, 20);
+    rl_hidTouch(pt, 4 /*ended*/, SLOT_COUNT);
 }
 
 // In Sideswipe: SLOT_AIRROLL doubles as POWERSLIDE on ground
@@ -1067,8 +1130,11 @@ static void RL_BotInit(void) {
     // If GEngine not resolved, blind mode will kick in automatically
     // after BLIND_ZERO_THRESH ticks of zero reads in rl_tick().
 
-    memset(gHold,   0, sizeof(gHold));
-    memset(gHoldEv, 0, sizeof(gHoldEv));
+    // Init IOHIDEvent touch injection layer (replaces UITouch private API)
+    rl_initHID();
+
+    memset(gSlotActive, 0, sizeof(gSlotActive));
+    memset(gSlotPt,     0, sizeof(gSlotPt));
     memset(gPadLastCollect, 0, sizeof(gPadLastCollect));
     memset(gPadIsLarge, 0, sizeof(gPadIsLarge));
 
