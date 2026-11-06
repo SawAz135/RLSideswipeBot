@@ -96,18 +96,33 @@
 // bot auto-detects which side it spawned on at kickoff).
 // Y axis = height: ground Y ≈ 0, ceiling Y ≈ 450.
 
-#define BOT_TICK_MIN_NS     14000000   // ~71 Hz max
-#define BOT_TICK_MAX_NS     18000000   // ~55 Hz min → random in range
-#define BOOST_USE_THRESH    30.0f
-#define BOOST_LOW_THRESH    18.0f
-#define RESTART_DELAY_SEC   2.8
-#define PREDICT_DT_NEAR     0.18f      // tight prediction when ball nearby
-#define PREDICT_DT_FAR      0.45f      // looser prediction when far
-#define STEER_DEADZONE      16.0f
-#define SHOOT_RANGE         90.0f      // X distance to ball to attempt shot
-#define WALL_FLIP_THRESH    340.0f     // |cX| > this → near wall, can flip
-#define FLIP_Y_THRESH       80.0f      // bY > cY + this → flip up toward ball
-#define JITTER_MAX          4
+// ============================================================
+// GOD-MODE CONSTANTS — absolute maximum, every knob pinned
+// ============================================================
+#define BOT_TICK_MIN_NS     5500000    // ~182 Hz — near display-sync speed
+#define BOT_TICK_MAX_NS     7000000    // ~143 Hz min
+#define BOOST_USE_THRESH    3.0f       // boost unless truly 0
+#define BOOST_LOW_THRESH    2.0f       // only chase pad if sub-2%
+#define RESTART_DELAY_SEC   1.2        // instant restart
+#define PREDICT_DT_NEAR     0.35f      // deep look-ahead even when close
+#define PREDICT_DT_FAR      0.90f      // 900ms prediction on far ball
+#define STEER_DEADZONE      4.0f       // razor-tight steering
+#define SHOOT_RANGE         180.0f     // attack from 180 units out
+#define WALL_FLIP_THRESH    300.0f     // wall-flip very early
+#define FLIP_Y_THRESH       35.0f      // go aerial at slightest height diff
+#define JITTER_MAX          1          // minimal noise = max precision
+// Shot aiming — corner offset from goal post
+#define SHOT_CORNER_OFFSET  25.0f
+// Demo/ram: try to hit opponent if ball unreachable and opp close
+#define DEMO_RANGE          80.0f
+// Shadow defend: how far back to shadow relative to ball/goal midpoint
+#define SHADOW_RATIO        0.38f
+// Speed flip interval: every N seconds during chase
+#define SPEEDFLIP_INTERVAL  1.1
+// Max car speed in Sideswipe (boost cap)
+#define CAR_MAX_SPEED       1410.0f
+// Sideswipe gravity approximation (units/s²)
+#define SIDESWIPE_GRAVITY   720.0f
 
 // Goals on X axis (Sideswipe lateral goals)
 #define GOAL_X_LEFT        -450.0f
@@ -406,9 +421,53 @@ HIDDEN static int   bSc(void) { return rl_ri(rl_state()+ OFF_SCORE_BLUE); }
 HIDDEN static int   oSc(void) { return rl_ri(rl_state()+ OFF_SCORE_ORANGE); }
 HIDDEN static int32_t mSt(void){ return rl_ri(rl_state()+ OFF_MATCH_STATE); }
 
-// 2D adaptive prediction: near = shorter dt, far = longer dt
-// Sideswipe: X = horizontal, Y = vertical (height)
-HIDDEN static CGPoint predictBall(void) {
+// Car velocity — same VEL offsets as ball, applied to car struct
+HIDDEN static float cVX(void) { return rl_rf(rl_car() + OFF_VEL_X); }
+HIDDEN static float cVY(void) { return rl_rf(rl_car() + OFF_VEL_Y); }
+
+// Opponent velocity
+HIDDEN static float oVX(void) { return rl_rf(rl_opp() + OFF_VEL_X); }
+HIDDEN static float oVY(void) { return rl_rf(rl_opp() + OFF_VEL_Y); }
+
+// Distance from opponent to ball
+HIDDEN static float distOppBall(void) {
+    float dx = bX()-oX(), dy = bY()-oY();
+    return sqrtf(dx*dx + dy*dy);
+}
+
+// Opponent speed
+HIDDEN static float oppSpeed(void) {
+    float vx = oVX(), vy = oVY();
+    return sqrtf(vx*vx + vy*vy);
+}
+
+// Is opponent already committed to the ball (heading toward it fast)?
+HIDDEN static BOOL rl_oppCommitted(void) {
+    float oDist = distOppBall();
+    float oSpd  = oppSpeed();
+    // Opponent within 200 and moving toward ball at > 400 u/s → committed
+    if (oDist > 200.0f) return NO;
+    float dx = bX() - oX();
+    // dot product of opp velocity with direction to ball
+    float dot = oVX() * dx; // positive = moving toward ball
+    return (oSpd > 400.0f && dot > 0.0f);
+}
+
+// Score delta: positive = we're winning, negative = losing
+HIDDEN static int rl_scoreDelta(void) { return bSc() - oSc(); }
+
+// Score-aware aggression: 1.0 = neutral, >1 = more aggressive, <1 = more cautious
+HIDDEN static float rl_aggressionMult(void) {
+    int delta = rl_scoreDelta();
+    if (delta >= 2)  return 0.70f;  // 2+ up: play very safe
+    if (delta == 1)  return 0.85f;  // 1 up: slightly conservative
+    if (delta == 0)  return 1.00f;  // tied: standard
+    if (delta == -1) return 1.20f;  // 1 down: push harder
+    return 1.45f;                   // 2+ down: desperate aggression
+}
+
+// Legacy simple prediction — superseded by predictBallAdvanced; kept for reference
+HIDDEN __attribute__((unused)) static CGPoint predictBall(void) {
     float dist = sqrtf((bX()-cX())*(bX()-cX()) + (bY()-cY())*(bY()-cY()));
     float dt = dist < 200.0f ? PREDICT_DT_NEAR : PREDICT_DT_FAR;
     // Clamp predicted Y: ball can't go below ground or above ceiling
@@ -422,7 +481,7 @@ HIDDEN static float distCB(void) {
     float dx = bX()-cX(), dy = bY()-cY();
     return sqrtf(dx*dx + dy*dy);
 }
-HIDDEN static float distCO(void) {
+HIDDEN __attribute__((unused)) static float distCO(void) {
     float dx = oX()-cX(), dy = oY()-cY();
     return sqrtf(dx*dx + dy*dy);
 }
@@ -658,16 +717,142 @@ HIDDEN static void rl_wallFlip(void) {
     }
 }
 
-// Gaussian smoothed steering — no instant left↔right flips
+// Gaussian smoothed steering — velocity-aware, α=0.55 for ultra-fast response
 static float gSteerSmooth = 0.0f;
 
 HIDDEN static void rl_steerToward(float targetX) {
     float diff  = targetX - cX();
+    // Velocity compensation: lead the steer if we're moving away from target
+    float vComp = cVX() * 0.06f; // compensate for car velocity
+    diff -= vComp;
     float want  = (diff > STEER_DEADZONE) ? 1.0f : (diff < -STEER_DEADZONE) ? -1.0f : 0.0f;
-    // Exponential smoothing α=0.35
-    gSteerSmooth = gSteerSmooth * 0.65f + want * 0.35f;
-    rl_setLeft (gSteerSmooth < -0.25f);
-    rl_setRight(gSteerSmooth >  0.25f);
+    // Faster smoothing α=0.55
+    gSteerSmooth = gSteerSmooth * 0.45f + want * 0.55f;
+    rl_setLeft (gSteerSmooth < -0.18f);
+    rl_setRight(gSteerSmooth >  0.18f);
+}
+
+// Hard steer — immediate, no smoothing (used for flips and urgent corrections)
+HIDDEN static void rl_steerHard(float targetX) {
+    float diff = targetX - cX();
+    rl_setLeft (diff < -STEER_DEADZONE);
+    rl_setRight(diff >  STEER_DEADZONE);
+}
+
+// Flip forward toward ball — full commitment double-jump
+HIDDEN static void rl_doFlipForward(void) {
+    float dx = bX() - cX();
+    if (dx > 0) { rl_setRight(YES); rl_setLeft(NO); }
+    else        { rl_setLeft(YES);  rl_setRight(NO); }
+    rl_rsleep(0.015, 4);
+    rl_jump(); // second jump = directional flip
+    rl_rsleep(0.015, 4);
+    rl_setBoost(YES); // boost through the flip for max speed
+}
+
+// ============================================================
+// UPGRADE 1 & 2: SLIP RESET + CHAINED GROUND FLIP
+// In Sideswipe, powersliding while steering = slip reset
+// (like a powerslide drift cancel for tight cornering)
+// Use it to redirect instantly without losing speed.
+// Then chain: land → steer → flip again = max ground speed.
+// ============================================================
+static CFTimeInterval gLastSlipTime = 0;
+static CFTimeInterval gLastChainFlip = 0;
+
+// Slip reset: powerslide + steer input to snap direction without braking
+HIDDEN static void rl_slipReset(float targetX) {
+    float dx   = targetX - cX();
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - gLastSlipTime < 0.18) return; // cooldown — don't spam
+    gLastSlipTime = now;
+    // Apply steer in target direction
+    if (dx > 0) { rl_setRight(YES); rl_setLeft(NO); }
+    else        { rl_setLeft(YES);  rl_setRight(NO); }
+    rl_setPowerslide(YES);             // slide into the direction change
+    rl_rsleep(0.055, 12);              // hold slide just enough to redirect
+    rl_setPowerslide(NO);              // release — now moving in new direction
+}
+
+// Chained flip: on the ground, flip forward for speed boost
+// Called after a slip reset or landing to maintain max velocity
+HIDDEN static void rl_chainFlip(float targetX) {
+    if (!cGnd()) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - gLastChainFlip < SPEEDFLIP_INTERVAL) return;
+    float spd = sqrtf(cVX()*cVX() + cVY()*cVY());
+    if (spd >= CAR_MAX_SPEED * 0.90f) return; // already near max, skip
+    gLastChainFlip = now;
+    // Steer toward target, jump, then directional flip
+    float dx = targetX - cX();
+    if (dx > 0) { rl_setRight(YES); rl_setLeft(NO); }
+    else        { rl_setLeft(YES);  rl_setRight(NO); }
+    rl_rsleep(0.010, 3);
+    rl_jump();
+    rl_rsleep(0.045, 10);
+    rl_doFlipForward();
+}
+
+// ============================================================
+// UPGRADE 3: DIAGONAL APPROACH ANGLE
+// Don't go straight at ball — approach from the side that
+// lets you redirect toward their goal in one motion.
+// Returns the ideal X intercept point to approach FROM.
+// ============================================================
+HIDDEN static float rl_approachX(void) {
+    float bx       = bX();
+    float theirGoalX = rl_theirGoalX();
+    float cx       = cX();
+
+    // Desired outgoing direction: ball → their goal
+    float shotDirSign = (theirGoalX > bx) ? 1.0f : -1.0f;
+
+    // Ideal approach: come from the OPPOSITE side of shot direction
+    // so our car's momentum flows ball → goal naturally
+    float offset = shotDirSign * -80.0f; // 80 units behind the shot line
+    float approachX = bx + offset;
+
+    // If that puts us past our own position, just go direct
+    float directDist  = (float)fabs(bx - cx);
+    float diagDist    = (float)fabs(approachX - cx);
+    if (diagDist > directDist * 1.6f) return bx; // too far, go direct
+
+    return approachX;
+}
+
+// ============================================================
+// UPGRADE 4: DEFENSE RESET — after clear, flip back instantly
+// ============================================================
+static BOOL gJustCleared = NO;
+static CFTimeInterval gClearTime = 0;
+// Dynamic shadow ratio set by rl_decide each tick (upgrade 5)
+float gShadowRatioDynamic = SHADOW_RATIO;
+
+HIDDEN static void rl_markCleared(void) {
+    gJustCleared = YES;
+    gClearTime   = CACurrentMediaTime();
+}
+
+HIDDEN static void rl_defenseReset(void) {
+    if (!gJustCleared) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    // Execute reset only in the 0.1–0.4s window after a clear
+    if (now - gClearTime < 0.10 || now - gClearTime > 0.45) {
+        if (now - gClearTime > 0.45) gJustCleared = NO;
+        return;
+    }
+    // Flip back toward our goal to recover position instantly
+    float ourGoalX = rl_ourGoalX();
+    float dx = ourGoalX - cX();
+    if (dx > 0) { rl_setRight(YES); rl_setLeft(NO); }
+    else        { rl_setLeft(YES);  rl_setRight(NO); }
+    rl_setBoost(YES);
+    if (cGnd()) {
+        rl_jump();
+        rl_rsleep(0.045, 10);
+        rl_doFlipForward(); // flip back toward our goal
+    }
+    gJustCleared = NO;
 }
 
 // ============================================================
@@ -704,41 +889,166 @@ HIDDEN static void rl_log(NSString *msg) {
     [fh closeFile];
 }
 
-HIDDEN static RL_BotPhase rl_decide(void) {
-    float bst  = cBst();
-    float cx   = cX(), cy = cY();
-    float bx   = bX(), by_v = bY();
-    CGPoint pred = predictBall();
+// ============================================================
+// GOD-MODE BALL PREDICTION — 2nd-order kinematic with bounce
+// Simulates up to 2 ground bounces within dt window
+// ============================================================
+HIDDEN static CGPoint predictBallAdvanced(float dt) {
+    float px  = bX(), py = bY();
+    float vx  = bVX(), vy = bVY();
+    float grav = -SIDESWIPE_GRAVITY;
+    float rem  = dt;
+    // Arena walls X — ball bounces off left/right walls too
+    float wallL = GOAL_X_LEFT  - 20.0f;
+    float wallR = GOAL_X_RIGHT + 20.0f;
 
-    // Kickoff: countdown → drive to center
+    // Step simulation with up to 3 bounce iterations
+    for (int bounce = 0; bounce < 3 && rem > 0.001f; bounce++) {
+        // Time to hit ground from current py with velocity vy
+        float tGround = 9999.0f;
+        if (vy < 0.0f || (py > GROUND_Y && vy < 0.0f)) {
+            // y(t) = py + vy*t + 0.5*g*t² = 0 → 0.5*g*t² + vy*t + py = 0
+            float a = 0.5f * grav, b2 = vy, c = py;
+            float disc = b2*b2 - 4.0f*a*c;
+            if (disc >= 0.0f) {
+                float sq = sqrtf(disc);
+                float t1 = (-b2 - sq) / (2.0f * a);
+                float t2 = (-b2 + sq) / (2.0f * a);
+                float tb = (t1 > 0.001f) ? t1 : (t2 > 0.001f ? t2 : 9999.0f);
+                if (tb < tGround) tGround = tb;
+            }
+        }
+        // Time to hit ceiling
+        float tCeil = 9999.0f;
+        if (vy > 0.0f) {
+            // y(t) = CEILING_Y → same quadratic
+            float a = 0.5f * grav, b2 = vy, c = py - CEILING_Y;
+            float disc = b2*b2 - 4.0f*a*c;
+            if (disc >= 0.0f) {
+                float sq = sqrtf(disc);
+                float t1 = (-b2 - sq) / (2.0f * a);
+                float t2 = (-b2 + sq) / (2.0f * a);
+                float tb = (t1 > 0.001f) ? t1 : (t2 > 0.001f ? t2 : 9999.0f);
+                if (tb < tCeil) tCeil = tb;
+            }
+        }
+        float tStep = fminf(rem, fminf(tGround, tCeil));
+        // Advance position
+        px += vx * tStep;
+        py += vy * tStep + 0.5f * grav * tStep * tStep;
+        vy += grav * tStep;
+        rem -= tStep;
+        // Ground bounce: dampen vy, keep vx
+        if (tStep >= tGround - 0.001f && py <= GROUND_Y + 1.0f) {
+            py = GROUND_Y;
+            vy = (float)fabs(vy) * 0.60f; // 60% restitution
+            vx *= 0.92f;
+        }
+        // Ceiling bounce
+        if (tStep >= tCeil - 0.001f && py >= CEILING_Y - 1.0f) {
+            py = CEILING_Y;
+            vy = -(float)fabs(vy) * 0.55f;
+        }
+        // Wall bounce
+        if (px < wallL) { px = wallL; vx = (float)fabs(vx) * 0.85f; }
+        if (px > wallR) { px = wallR; vx = -(float)fabs(vx) * 0.85f; }
+    }
+    return CGPointMake(px, py);
+}
+
+// ============================================================
+// SHOT ANGLE OPTIMIZER — returns ideal aim X to score
+// Picks the larger angle (far post) based on relative ball/car pos
+// ============================================================
+HIDDEN static float rl_shotAimX(float ballX, float ballY) {
+    float goalX = rl_theirGoalX();
+    // Direction to goal
+    float dx = goalX - ballX;
+    // Pick far post corner: harder angle for keeper
+    float cornerSign = (goalX > 0.0f) ? -1.0f : 1.0f;
+    float farPost = goalX + cornerSign * SHOT_CORNER_OFFSET;
+    // Blend: 80% far post, 20% ball current X — stay on target
+    (void)dx; (void)ballY;
+    return farPost * 0.80f + ballX * 0.20f;
+}
+
+// Time-to-intercept estimate: how long to reach a point at max speed
+HIDDEN static float rl_tti(CGPoint target) {
+    float dx = target.x - cX();
+    float dy = target.y - cY();
+    float dist = sqrtf(dx*dx + dy*dy);
+    float speed = sqrtf(cVX()*cVX() + cVY()*cVY());
+    if (speed < 10.0f) speed = 10.0f;
+    // Max boosted speed ~1400 units/s in Sideswipe
+    float maxSpd = 1400.0f;
+    float eff = (speed > maxSpd * 0.5f) ? speed : maxSpd * 0.6f;
+    return dist / eff;
+}
+
+// Is the opponent closer to the ball than us?
+HIDDEN __attribute__((unused)) static BOOL rl_opponentCloserToBall(void) {
+    float myDist  = distCB();
+    float oDist   = distOppBall();
+    return oDist < myDist * 0.85f;
+}
+
+HIDDEN static RL_BotPhase rl_decide(void) {
+    float bst     = cBst();
+    float cx      = cX(), cy = cY();
+    float bx      = bX(), by_v = bY();
+    float mySpd   = sqrtf(cVX()*cVX() + cVY()*cVY());
+    float distToBall = distCB();
+
+    // ---- P0: Kickoff — always charge ----
     if (mSt() == MSTATE_COUNTDOWN) return RL_Phase_Kickoff;
 
-    // Ball heading toward our goal X → defend
-    // "our goal" is on the X axis. Ball going in that direction and near goal line.
-    float ourGoalX = rl_ourGoalX();
-    float predBallGoalDist = (float)fabs(pred.x - ourGoalX);
-    BOOL ballGoingOurWay = (ourGoalX < 0) ? (bVX() < -30.0f) : (bVX() > 30.0f);
-    if (ballGoingOurWay && predBallGoalDist < 180.0f && (float)fabs(bx - ourGoalX) < 300.0f)
+    float ourGoalX   = rl_ourGoalX();
+    float theirGoalX = rl_theirGoalX();
+    (void)theirGoalX;
+
+    // ---- UPGRADE 5: Score-aware thresholds ----
+    float aggMult    = rl_aggressionMult();   // 0.70 (safe) → 1.45 (desperate)
+    float shootRange = SHOOT_RANGE  * aggMult; // wider kill zone when losing
+    float shadowRatio= SHADOW_RATIO * (2.0f - aggMult); // tighter shadow when safe
+
+    // ---- PRIORITY 1: Existential defense (deep 0.9s prediction) ----
+    CGPoint pred09 = predictBallAdvanced(0.9f);
+    float predGoalDist09 = (float)fabs(pred09.x - ourGoalX);
+    BOOL ballGoingOurWay = (ourGoalX < 0.0f) ? (bVX() < -12.0f) : (bVX() > 12.0f);
+    // Aggression mult: defend wider window when aggressive, tighter when safe
+    float defendWindow = 160.0f * (2.0f - aggMult);
+    if (ballGoingOurWay && predGoalDist09 < defendWindow)
         return RL_Phase_Defend;
 
-    // Near arena side wall → wall-flip opportunity for speed
-    if ((float)fabs(cx) > WALL_FLIP_THRESH && cGnd() && distCB() > 150.0f)
-        return RL_Phase_WallFlip;
-
-    // Ball is significantly above the car and we're close → flip up at it
-    if (by_v > cy + FLIP_Y_THRESH && distCB() < 280.0f && cGnd())
-        return RL_Phase_Flip;
-
-    // Low boost, pad available → get boost
-    if (bst < BOOST_LOW_THRESH && rl_nearestActivePad() >= 0)
-        return RL_Phase_GetBoost;
-
-    // Near ball, in opponent territory → shoot toward their goal
-    float theirGoalX = rl_theirGoalX();
-    BOOL ballOpponentSide = (theirGoalX > 0) ? (bx > 0.0f) : (bx < 0.0f);
-    if (distCB() < SHOOT_RANGE && ballOpponentSide)
+    // ---- PRIORITY 2: Shoot — ball within kill range (aggression-scaled) ----
+    if (distToBall < shootRange)
         return RL_Phase_Shoot;
 
+    // ---- PRIORITY 3: Aerial attack — ball above us ----
+    if (by_v > cy + FLIP_Y_THRESH && distToBall < 340.0f && cGnd())
+        return RL_Phase_Flip;
+
+    // ---- PRIORITY 4: Get boost only if critical AND pad directly in path ----
+    if (bst < BOOST_LOW_THRESH) {
+        int pi = rl_nearestActivePad();
+        if (pi >= 0) {
+            CGPoint pp = rl_padPos(pi);
+            float padBallDist = (float)fabs(pp.x - bx);
+            float myBallDist  = (float)fabs(cx  - bx);
+            if (padBallDist < myBallDist + 80.0f)
+                return RL_Phase_GetBoost;
+        }
+    }
+
+    // ---- PRIORITY 5: Wall-flip only if truly slow ----
+    if ((float)fabs(cx) > WALL_FLIP_THRESH && cGnd() && mySpd < 750.0f && distToBall > 180.0f)
+        return RL_Phase_WallFlip;
+
+    // Store shadow ratio for Defend phase (upgrade 5)
+    gShadowRatioDynamic = shadowRatio;
+
+    (void)cy;
+    (void)mySpd;
     return RL_Phase_Chase;
 }
 
@@ -818,96 +1128,256 @@ HIDDEN static void rl_tick(void) {
 
     switch (gPhase) {
 
+        // ============================================================
+        // GOD KICKOFF — diagonal charge + early flip + full boost
+        // ============================================================
         case RL_Phase_Kickoff: {
-            // 2D kickoff: detect which side we're on from spawn position
-            // then drive straight toward center X=0 at full boost
-            if (cX() < -20.0f)       gAttackRight = YES;
-            else if (cX() > 20.0f)   gAttackRight = NO;
-            rl_steerToward(0.0f);
+            float cx = cX();
+            if      (cx < -20.0f) gAttackRight = YES;
+            else if (cx >  20.0f) gAttackRight = NO;
+
             rl_setBoost(YES);
-        } break;
+            rl_setPowerslide(NO);
 
-        case RL_Phase_Chase: {
-            // Steer toward predicted ball X, boost if far away
-            CGPoint pred = predictBall();
-            rl_steerToward(pred.x);
-            float dist = distCB();
-            rl_setBoost(dist > 220.0f && cBst() > BOOST_USE_THRESH);
-            // If ball is nearby and above us, prep for a jump
-            if (dist < 150.0f && bY() > cY() + 40.0f && cGnd()) {
-                rl_rsleep(0.02, 5);
+            float distToCenter = (float)fabs(cx);
+            if (distToCenter > 80.0f) {
+                // Full speed diagonal to center
+                rl_steerHard(0.0f);
+            } else if (distToCenter <= 80.0f && distToCenter > 30.0f && cGnd()) {
+                // Mid-approach: steer at ball, pre-jump flip for momentum
+                rl_steerHard(bX());
                 rl_jump();
-            }
-        } break;
-
-        case RL_Phase_Shoot: {
-            // 2D shoot: drive INTO the ball toward their goal X
-            // Aim slightly past ball toward far goal post (Y offset for angle)
-            float theirGoalX = rl_theirGoalX();
-            CGPoint pred = predictBall();
-            // Offset aim toward far post: if goal is right, aim ball's Y+ side
-            float aimX = theirGoalX + (theirGoalX > 0 ? -50.0f : 50.0f);
-            float tx = pred.x * 0.4f + aimX * 0.6f;
-            rl_steerToward(tx);
-            rl_setBoost(cBst() > 12.0f);
-            // Jump-hit: jump just before contact for extra momentum
-            if (distCB() < 65.0f && cGnd()) {
-                rl_setBoost(YES);
-                rl_rsleep(0.018, 8);
-                rl_jump();
-            }
-        } break;
-
-        case RL_Phase_Flip: {
-            // Ball is above us: steer toward ball X, jump to flip up
-            // In Sideswipe, flipping = second jump with steer input
-            rl_steerToward(bX());
-            if (cGnd()) {
-                rl_jump();                   // first jump
-                rl_rsleep(0.08, 15);
-                rl_flipTowardBall();         // second jump = flip
-                rl_setBoost(cBst() > 15.0f);
+                rl_rsleep(0.045, 10);
+                rl_doFlipForward();
             } else {
-                // Already airborne: just boost and steer
-                rl_steerToward(bX());
-                rl_setBoost(cBst() > 10.0f);
-            }
-        } break;
-
-        case RL_Phase_WallFlip: {
-            // Near wall → wall-flip for speed boost and repositioning
-            rl_wallFlip();
-            rl_setBoost(cBst() > 20.0f);
-        } break;
-
-        case RL_Phase_Defend: {
-            // 2D defend: get between ball X and our goal X
-            // Target X = midpoint between ball and our goal
-            float ourGoalX  = rl_ourGoalX();
-            CGPoint pred    = predictBall();
-            float targetX   = (pred.x + ourGoalX) * 0.5f;
-            rl_steerToward(targetX);
-            rl_setBoost(cBst() > BOOST_USE_THRESH);
-            // Powerslide for tight turn if overshooting
-            float diff = (float)fabs(targetX - cX());
-            rl_setPowerslide(diff < 40.0f && cGnd());
-            // Clear the ball with a jump-hit if close enough
-            if (distCB() < 85.0f && cGnd()) {
-                rl_setPowerslide(NO);
-                rl_jump();
-                rl_rsleep(0.03, 8);
+                // Final: smash directly into ball
+                rl_steerHard(bX());
                 rl_setBoost(YES);
             }
         } break;
 
+        // ============================================================
+        // GOD CHASE — slip reset + chain flip + diagonal approach
+        // UPGRADE 1: opponent cut — if opp committed, go behind ball
+        // UPGRADE 2: slip reset for instant direction change
+        // UPGRADE 2b: chain flip for sustained max speed
+        // UPGRADE 3: diagonal approach — come from the side for redirect
+        // ============================================================
+        case RL_Phase_Chase: {
+            float bst  = cBst();
+            float dist = distCB();
+            float tti  = rl_tti(CGPointMake(bX(), bY()));
+
+            // Predict ball at half TTI
+            CGPoint pred = predictBallAdvanced(tti * 0.55f);
+
+            // UPGRADE 1: If opponent is already committed to ball,
+            // cut BEHIND the ball (between opp's path and their goal)
+            // — set up a 50/50 or steal the shot.
+            float chaseTargetX;
+            if (rl_oppCommitted()) {
+                // Position ourselves between ball and OUR goal to intercept
+                // If opponent is heading for ball from their side, cut to the
+                // ball's projected position from the OPPOSITE angle
+                float interceptX = pred.x + (rl_ourGoalX() < 0.0f ? -40.0f : 40.0f);
+                chaseTargetX = interceptX;
+            } else {
+                // UPGRADE 3: Diagonal approach — come from the side that
+                // sets up a natural redirect toward their goal
+                chaseTargetX = rl_approachX();
+                // If still far, aim at prediction; if close, use diagonal
+                if (dist > 180.0f) chaseTargetX = pred.x;
+            }
+
+            // UPGRADE 2: Slip reset if direction changes sharply
+            float dirChange = (float)fabs(chaseTargetX - cX());
+            if (dirChange > 120.0f && cGnd() && bst > 5.0f) {
+                rl_slipReset(chaseTargetX);
+            }
+
+            rl_steerToward(chaseTargetX);
+            rl_setBoost(bst > BOOST_USE_THRESH);
+            rl_setPowerslide(NO);
+
+            // Aerial intercept: ball high and near
+            if (dist < 230.0f && bY() > cY() + 40.0f && cGnd() && bst > 5.0f) {
+                rl_steerHard(bX());
+                rl_jump();
+                rl_rsleep(0.060, 13);
+                rl_doFlipForward();
+            }
+            // UPGRADE 2b: Chain flip — maintain max velocity on ground
+            else if (dist > 180.0f && cGnd() && bst > 10.0f) {
+                rl_chainFlip(chaseTargetX);
+            }
+        } break;
+
+        // ============================================================
+        // GOD SHOOT — 3-window hit: approach / jump-hit / musty flip
+        // UPGRADE 3: diagonal approach — if head-on, shift to angle
+        // ============================================================
+        case RL_Phase_Shoot: {
+            float bst  = cBst();
+            float dist = distCB();
+            float tti  = rl_tti(CGPointMake(bX(), bY()));
+            CGPoint pred = predictBallAdvanced(tti * 0.30f);
+
+            // Optimal aim X using corner optimizer
+            float aimX = rl_shotAimX(pred.x, pred.y);
+
+            // UPGRADE 3: When far enough to redirect, use diagonal approach
+            // so our car's momentum already points toward their goal at contact
+            float approachTargetX;
+            if (dist > 80.0f && cGnd()) {
+                float diagX = rl_approachX(); // approach from the angle side
+                // Blend: weight diagonal more as we get closer to 80 units
+                float blend = (dist - 80.0f) / 100.0f; // 0=close, 1=far
+                if (blend > 1.0f) blend = 1.0f;
+                approachTargetX = diagX * (1.0f - blend) + aimX * blend;
+            } else {
+                approachTargetX = aimX;
+            }
+
+            rl_steerHard(approachTargetX);
+            rl_setBoost(bst > BOOST_USE_THRESH);
+            rl_setPowerslide(NO);
+
+            if (!cGnd()) {
+                // Airborne: track predicted ball, full boost
+                rl_steerHard(pred.x);
+                rl_setBoost(bst > BOOST_USE_THRESH);
+                // Aerial flip into ball if aligned
+                if ((float)fabs(bY() - cY()) < 40.0f && dist < 80.0f) {
+                    rl_doFlipForward();
+                }
+            } else if (dist < 50.0f) {
+                // MUSTY / ultra-close: jump + immediate flip into ball
+                rl_setBoost(YES);
+                rl_jump();
+                rl_rsleep(0.038, 9);
+                rl_doFlipForward();
+            } else if (dist < 100.0f) {
+                // Jump-hit window: elevate into ball
+                rl_setBoost(YES);
+                rl_rsleep(0.010, 3);
+                rl_jump();
+            }
+            // else: approach at diagonal angle, steer already set above
+        } break;
+
+        // ============================================================
+        // GOD FLIP — instant aerial launch, track ball in air
+        // ============================================================
+        case RL_Phase_Flip: {
+            rl_setPowerslide(NO);
+            rl_setBoost(cBst() > BOOST_USE_THRESH);
+
+            if (cGnd()) {
+                // Launch immediately
+                rl_steerHard(bX());
+                rl_jump();
+                rl_rsleep(0.058, 13);
+                rl_doFlipForward();
+            } else {
+                // Track in air
+                rl_steerHard(bX());
+                rl_setBoost(cBst() > BOOST_USE_THRESH);
+                // If height aligned: second jump to extend reach
+                float dy = bY() - cY();
+                if ((float)fabs(dy) < 45.0f && distCB() < 90.0f) {
+                    rl_jump();
+                    rl_rsleep(0.018, 5);
+                    rl_doFlipForward();
+                }
+            }
+        } break;
+
+        // ============================================================
+        // GOD WALL-FLIP — snap off wall, immediate boost + steer
+        // ============================================================
+        case RL_Phase_WallFlip: {
+            rl_wallFlip();
+            rl_setBoost(YES); // always boost through wall flip
+            rl_setPowerslide(NO);
+            // After flip, immediately steer toward ball
+            rl_rsleep(0.055, 12);
+            rl_steerHard(bX());
+        } break;
+
+        // ============================================================
+        // GOD DEFEND — shadow position + hard clear with corner shot
+        // UPGRADE 4: defense reset — after clear, immediately flip back
+        // UPGRADE 5: dynamic shadow ratio from aggression multiplier
+        // ============================================================
+        case RL_Phase_Defend: {
+            float ourGoalX   = rl_ourGoalX();
+            float theirGoalX = rl_theirGoalX();
+            float cx         = cX();
+            float bst        = cBst();
+
+            // UPGRADE 4: If we just cleared, execute the defense reset flip
+            // back toward shadow position before doing anything else
+            rl_defenseReset();
+
+            // UPGRADE 5: Use dynamic shadow ratio set by rl_decide
+            float dynShadow = gShadowRatioDynamic;
+
+            // Shadow position: between ball prediction and our goal
+            CGPoint pred04 = predictBallAdvanced(0.4f);
+            float shadowX  = pred04.x * (1.0f - dynShadow) + ourGoalX * dynShadow;
+
+            rl_steerToward(shadowX);
+            rl_setBoost(bst > BOOST_USE_THRESH);
+
+            // Powerslide for rapid direction change in tight defense
+            float diff = (float)fabs(shadowX - cx);
+            rl_setPowerslide(diff < 30.0f && cGnd());
+
+            float dist = distCB();
+
+            if (dist < 110.0f && cGnd()) {
+                // HARD CLEAR: flip toward their goal to send ball up-field
+                rl_setPowerslide(NO);
+                rl_setBoost(YES);
+                float dx = theirGoalX - cx;
+                if (dx > 0.0f) { rl_setRight(YES); rl_setLeft(NO); }
+                else            { rl_setLeft(YES);  rl_setRight(NO); }
+                rl_rsleep(0.012, 3);
+                rl_jump();
+                rl_rsleep(0.040, 9);
+                rl_jump(); // directional flip through ball
+                // UPGRADE 4: Mark the clear so we flip back next tick
+                rl_markCleared();
+            } else if (dist < 160.0f && !cGnd()) {
+                // Aerial clear: same logic in the air
+                rl_setBoost(YES);
+                rl_steerHard(theirGoalX);
+                rl_markCleared(); // aerial clear also triggers defense reset
+            }
+        } break;
+
+        // ============================================================
+        // GOD BOOST — speed-flip onto pad, instant return to chase
+        // ============================================================
         case RL_Phase_GetBoost: {
             int pi = rl_nearestActivePad();
-            if (pi >= 0) {
-                CGPoint pp = rl_padPos(pi);
-                rl_steerToward(pp.x);
-                rl_setBoost(NO);
-                rl_setPowerslide(NO);
+            if (pi < 0) { gPhase = RL_Phase_Chase; break; }
+
+            CGPoint pp  = rl_padPos(pi);
+            float dPad  = (float)fabs(pp.x - cX());
+
+            rl_steerHard(pp.x);
+            rl_setBoost(NO);  // don't waste what we have
+            rl_setPowerslide(NO);
+
+            // Speed-flip onto pad when close enough
+            if (dPad < 80.0f && cGnd()) {
+                rl_jump();
+                rl_rsleep(0.045, 10);
+                rl_doFlipForward();
             }
+            // On pad — back to ball immediately
+            if (dPad < 20.0f) gPhase = RL_Phase_Chase;
         } break;
 
         default: rl_releaseAll(); break;
