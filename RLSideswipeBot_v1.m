@@ -476,24 +476,52 @@ HIDDEN static CGPoint rl_padPos(int idx) {
 }
 
 // ============================================================
-// MARK: — Touch Injection (no-jailbreak safe, iOS 15/16/17+)
+// MARK: — Touch Injection (Unreal Engine IOSView, no jailbreak)
 // ============================================================
-// Works inside the app's own process — no entitlements needed.
-// Uses UIKit's internal touch delivery via swizzled UIApplication
-// sendEvent: + synthetic UITouch objects created via class_copyIvarList
-// to set private fields without calling private selectors directly.
+// Unreal Engine on iOS receives all touches through its own UIView
+// subclass (IOSView / FIOSView). It hooks touchesBegan:withEvent:
+// directly on that view — UIApplication sendEvent: never reaches UE.
+//
+// Fix: find the Unreal main view, build a minimal synthetic UITouch
+// using private-ivar KVC (no banned selectors), then call
+// touchesBegan:/Moved:/Ended: directly on that view on the main thread.
+// This is the only method that reaches FIOSInputInterface on non-JB iOS.
 // ============================================================
 
-// Private UITouch ivar setters via KVC — works without calling
-// private ObjC selectors, so no crash on iOS 15/16/17.
-HIDDEN static void rl_setTouchIvar(UITouch *t, NSString *key, id val) {
-    @try { [t setValue:val forKey:key]; } @catch (...) {}
-}
-HIDDEN static void rl_setTouchIvarCGPoint(UITouch *t, NSString *key, CGPoint pt) {
-    @try { [t setValue:[NSValue valueWithCGPoint:pt] forKey:key]; } @catch (...) {}
-}
-HIDDEN static void rl_setTouchIvarInt(UITouch *t, NSString *key, NSInteger v) {
-    @try { [t setValue:@(v) forKey:key]; } @catch (...) {}
+// ——— Unreal view cache ———
+static UIView *gUEView = nil;
+
+// Find Unreal's IOSView (the view that owns all game touches)
+HIDDEN static UIView *rl_ueView(void) {
+    if (gUEView) return gUEView;
+    UIWindow *win = nil;
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes.allObjects)
+        if ([s isKindOfClass:[UIWindowScene class]]) {
+            win = [(UIWindowScene *)s windows].firstObject;
+            break;
+        }
+    if (!win) win = [UIApplication sharedApplication].windows.firstObject;
+    if (!win) return nil;
+
+    // Unreal's view is typically the root view controller's view,
+    // or a subview named "IOSView" / class containing "IOS"
+    UIView *root = win.rootViewController.view;
+    if (!root) root = win;
+
+    // Walk subviews looking for the deepest full-screen view (UE renders to it)
+    // Fall back to root if none found
+    __block UIView *best = root;
+    CGFloat screenArea = win.bounds.size.width * win.bounds.size.height;
+    void (^scan)(UIView *) = nil;
+    __block void (^scan_)(UIView *) = nil;
+    scan_ = ^(UIView *v) {
+        CGFloat area = v.bounds.size.width * v.bounds.size.height;
+        if (area >= screenArea * 0.9f) best = v;
+        for (UIView *sub in v.subviews) scan_(sub);
+    };
+    scan_(root);
+    gUEView = best;
+    return gUEView;
 }
 
 HIDDEN static UIWindow *rl_win(void) {
@@ -510,51 +538,50 @@ HIDDEN static CGPoint rl_normToScreen(CGPoint norm) {
     return rl_jitter(CGPointMake(norm.x * sz.width, norm.y * sz.height));
 }
 
-// Build a synthetic UITouch at screen position with given phase
-HIDDEN static UITouch *rl_makeTouch(CGPoint screenPt, UITouchPhase phase, UIWindow *w) {
+// Build synthetic UITouch via KVC (no private selectors — safe iOS 15-17)
+HIDDEN static UITouch *rl_makeTouch(CGPoint screenPt, UITouchPhase phase,
+                                     UIView *view, UIWindow *win) {
     UITouch *t = [[UITouch alloc] init];
-    // Set internal ivars via KVC — safe on all iOS versions
-    rl_setTouchIvarCGPoint(t, @"locationInWindow",         screenPt);
-    rl_setTouchIvarCGPoint(t, @"previousLocationInWindow", screenPt);
-    rl_setTouchIvarInt(t, @"phase",           (NSInteger)phase);
-    rl_setTouchIvarInt(t, @"tapCount",        1);
-    rl_setTouchIvarInt(t, @"touchType",       0); // UITouchTypeDirect
-    rl_setTouchIvar(t,    @"window",          w);
-    rl_setTouchIvar(t,    @"view",            w);
-    rl_setTouchIvar(t,    @"gestureRecognizers", [NSArray array]);
-    [t setValue:@(CACurrentMediaTime()) forKeyPath:@"timestamp"];
+    @try { [t setValue:[NSValue valueWithCGPoint:screenPt] forKey:@"locationInWindow"]; }         @catch (...) {}
+    @try { [t setValue:[NSValue valueWithCGPoint:screenPt] forKey:@"previousLocationInWindow"]; } @catch (...) {}
+    @try { [t setValue:@((NSInteger)phase)  forKey:@"phase"]; }     @catch (...) {}
+    @try { [t setValue:@(1)                 forKey:@"tapCount"]; }  @catch (...) {}
+    @try { [t setValue:@(0)                 forKey:@"touchType"]; } @catch (...) {} // UITouchTypeDirect
+    @try { [t setValue:win                  forKey:@"window"]; }    @catch (...) {}
+    @try { [t setValue:view                 forKey:@"view"]; }      @catch (...) {}
+    @try { [t setValue:[NSArray array]      forKey:@"gestureRecognizers"]; } @catch (...) {}
+    @try { [t setValue:@(CACurrentMediaTime()) forKey:@"timestamp"]; } @catch (...) {}
     return t;
 }
 
-// Deliver touch event on main thread via UIApplication sendEvent:
-HIDDEN static void rl_deliverTouch(UITouch *t, UIWindow *w) {
-    UIEvent *e = [[UIApplication sharedApplication] valueForKey:@"currentEvent"];
-    if (!e) {
-        // Create a minimal event container
-        Class evClass = NSClassFromString(@"UITouchesEvent");
-        if (!evClass) evClass = [UIEvent class];
-        e = [[evClass alloc] init];
-    }
-    // Add touch to event via KVC
-    @try {
-        NSMutableSet *touches = [e valueForKey:@"allTouches"];
-        if (!touches || ![touches isKindOfClass:[NSMutableSet class]]) {
-            touches = [NSMutableSet set];
-            [e setValue:touches forKey:@"allTouches"];
-        }
-        [touches addObject:t];
-    } @catch (...) {}
+// Deliver touches by calling touchesBegan:/Moved:/Ended: directly on UE view
+HIDDEN static void rl_sendPhase(CGPoint screenPt, UITouchPhase phase, UIView *view) {
+    if (!view) return;
+    UIWindow *win = rl_win();
+    UITouch *t = rl_makeTouch(screenPt, phase, view, win);
+    NSSet *set = [NSSet setWithObject:t];
 
-    // Deliver on main thread
+    // Create a bare UIEvent (just a container — UE reads the touch set)
+    UIEvent *ev = [[UIEvent alloc] init];
+
     dispatch_async(dispatch_get_main_queue(), ^{
-        [[UIApplication sharedApplication] sendEvent:e];
+        switch (phase) {
+            case UITouchPhaseBegan:
+                [view touchesBegan:set withEvent:ev];
+                break;
+            case UITouchPhaseMoved:
+                [view touchesMoved:set withEvent:ev];
+                break;
+            case UITouchPhaseEnded:
+                [view touchesEnded:set withEvent:ev];
+                break;
+            case UITouchPhaseCancelled:
+                [view touchesCancelled:set withEvent:ev];
+                break;
+            default:
+                break;
+        }
     });
-}
-
-// Send touch at screen point with phase
-HIDDEN static void rl_sendPhase(CGPoint screenPt, UITouchPhase phase, UIWindow *w) {
-    UITouch *t = rl_makeTouch(screenPt, phase, w);
-    rl_deliverTouch(t, w);
 }
 
 HIDDEN static void rl_initHID(void) {
@@ -575,17 +602,15 @@ static CGPoint gSlotPt[SLOT_COUNT];
 
 HIDDEN static void rl_holdBegin(int slot, CGPoint norm) {
     if (gSlotActive[slot]) return;
-    UIWindow *w = rl_win();
     CGPoint pt = rl_normToScreen(norm);
     gSlotPt[slot]     = pt;
     gSlotActive[slot] = YES;
-    rl_sendPhase(pt, UITouchPhaseBegan, w);
+    rl_sendPhase(pt, UITouchPhaseBegan, rl_ueView());
 }
 
 HIDDEN static void rl_holdEnd(int slot) {
     if (!gSlotActive[slot]) return;
-    UIWindow *w = rl_win();
-    rl_sendPhase(gSlotPt[slot], UITouchPhaseEnded, w);
+    rl_sendPhase(gSlotPt[slot], UITouchPhaseEnded, rl_ueView());
     gSlotActive[slot] = NO;
 }
 
@@ -594,11 +619,11 @@ HIDDEN static void rl_releaseAll(void) {
 }
 
 HIDDEN static void rl_tap(CGPoint norm, double hold) {
-    UIWindow *w = rl_win();
+    UIView *v = rl_ueView();
     CGPoint pt = rl_normToScreen(norm);
-    rl_sendPhase(pt, UITouchPhaseBegan, w);
+    rl_sendPhase(pt, UITouchPhaseBegan, v);
     if (hold > 0) rl_rsleep(hold, 20);
-    rl_sendPhase(pt, UITouchPhaseEnded, w);
+    rl_sendPhase(pt, UITouchPhaseEnded, v);
 }
 
 // In Sideswipe: SLOT_AIRROLL doubles as POWERSLIDE on ground
